@@ -146,7 +146,9 @@ public class CalendarViewModel : INotifyPropertyChanged
             // WinRT not available
         }
 
-        return new MockCalendarService();
+        // 正式构建中系统日历不可用时必须保持为空。
+        // MockCalendarService 仅用于开发调试，不能向用户展示伪造的日程。
+        return new EmptyCalendarService();
     }
 
     private static readonly string[] SubscriptionColors = {

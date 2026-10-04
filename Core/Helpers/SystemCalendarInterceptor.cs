@@ -19,6 +19,7 @@ public class SystemCalendarInterceptor : IDisposable
     private bool _disposed;
     private DateTime _lastInterceptTime;
     private static readonly TimeSpan InterceptCooldown = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan ClockInteractionWindow = TimeSpan.FromMilliseconds(1500);
     private readonly HashSet<IntPtr> _hiddenWindows = new();
 
     // Win32 常量
@@ -71,6 +72,28 @@ public class SystemCalendarInterceptor : IDisposable
     [DllImport("user32.dll")]
     private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindowEx(
+        IntPtr hWndParent,
+        IntPtr hWndChildAfter,
+        string? lpszClass,
+        string? lpszWindow);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetTickCount();
+
     [StructLayout(LayoutKind.Sequential)]
     private struct MONITORINFO
     {
@@ -84,10 +107,26 @@ public class SystemCalendarInterceptor : IDisposable
         IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
         int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
 
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT
     {
         public int Left, Top, Right, Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LASTINPUTINFO
+    {
+        public uint cbSize;
+        public uint dwTime;
     }
 
     public SystemCalendarInterceptor(Dispatcher dispatcher)
@@ -177,6 +216,15 @@ public class SystemCalendarInterceptor : IDisposable
             // 注意：不检查 IsWindowVisible，因为 UNCLOAK 事件时窗口可能尚未完全可见
             if (!IsSystemCalendarWindow(hwnd))
                 return;
+
+            // 只替换由用户点击任务栏时钟触发的系统面板。
+            // 闹钟、普通通知、Quick Settings 和 Win+N 都可能创建形态相近的
+            // ShellExperienceHost 窗口，不能仅根据窗口位置/尺寸判断。
+            if (!IsTaskbarClockInvocation())
+            {
+                Log("ShellExperienceHost candidate ignored: no recent taskbar clock interaction");
+                return;
+            }
 
             // 防抖：500ms 内只处理第一次拦截
             var now = DateTime.UtcNow;
@@ -300,6 +348,76 @@ public class SystemCalendarInterceptor : IDisposable
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// 判断当前系统面板是否紧跟在用户点击任务栏时钟之后出现。
+    /// 使用 Explorer 暴露的 TrayClockWClass 精确限定时钟区域，并要求近期存在用户输入，
+    /// 避免 Clock 闹钟、toast、Quick Settings 或 Win+N 误触发 WinCal。
+    /// </summary>
+    private static bool IsTaskbarClockInvocation()
+    {
+        if (!WasUserInputRecent() || !GetCursorPos(out var cursor))
+            return false;
+
+        var primaryTaskbar = FindWindow("Shell_TrayWnd", null);
+        if (primaryTaskbar != IntPtr.Zero && IsPointInsideTaskbarClock(primaryTaskbar, cursor))
+            return true;
+
+        var foundOnSecondaryTaskbar = false;
+        EnumWindows((window, _) =>
+        {
+            var className = GetWindowClassName(window);
+            if (!string.Equals(className, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (!IsPointInsideTaskbarClock(window, cursor))
+                return true;
+
+            foundOnSecondaryTaskbar = true;
+            return false;
+        }, IntPtr.Zero);
+
+        return foundOnSecondaryTaskbar;
+    }
+
+    private static bool WasUserInputRecent()
+    {
+        var lastInput = new LASTINPUTINFO
+        {
+            cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>()
+        };
+
+        if (!GetLastInputInfo(ref lastInput))
+            return false;
+
+        // uint subtraction intentionally handles GetTickCount wraparound.
+        var elapsedMs = unchecked(GetTickCount() - lastInput.dwTime);
+        return elapsedMs <= ClockInteractionWindow.TotalMilliseconds;
+    }
+
+    private static bool IsPointInsideTaskbarClock(IntPtr taskbar, POINT cursor)
+    {
+        var trayNotify = FindWindowEx(taskbar, IntPtr.Zero, "TrayNotifyWnd", null);
+        if (trayNotify == IntPtr.Zero)
+            return false;
+
+        var clock = FindWindowEx(trayNotify, IntPtr.Zero, "TrayClockWClass", null);
+        if (clock == IntPtr.Zero || !GetWindowRect(clock, out var clockRect))
+            return false;
+
+        return cursor.X >= clockRect.Left &&
+               cursor.X < clockRect.Right &&
+               cursor.Y >= clockRect.Top &&
+               cursor.Y < clockRect.Bottom;
+    }
+
+    private static string GetWindowClassName(IntPtr hwnd)
+    {
+        var className = new System.Text.StringBuilder(256);
+        return GetClassName(hwnd, className, className.Capacity) > 0
+            ? className.ToString()
+            : string.Empty;
     }
 
     /// <summary>
