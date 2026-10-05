@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Automation;
@@ -8,79 +9,39 @@ using System.Windows.Threading;
 namespace WinCal.Core.Helpers;
 
 /// <summary>
-/// 监控并替换 Windows 系统日历弹窗。
-/// 当检测到系统日历/通知中心弹出时，立即隐藏它并触发我们的日历面板。
+/// 监听任务栏时钟的真实鼠标点击。
+/// 左键直接打开 WinCal，右键打开 Windows 原生通知中心；通知和闹钟本身不会触发。
 /// </summary>
 public class SystemCalendarInterceptor : IDisposable
 {
-    private IntPtr _hook;
     private IntPtr _mouseHook;
-    private GCHandle _gcHandle;
     private GCHandle _mouseGcHandle;
     private readonly Dispatcher _dispatcher;
     private Action? _showPopupCallback;
     private Action? _showSystemCalendarCallback;
     private bool _disposed;
-    private DateTime _lastInterceptTime;
-    private DateTime _lastTaskbarClockClickTime;
+    private bool _suppressClockLeftButtonUp;
     private bool _suppressClockRightButtonUp;
-    private static readonly TimeSpan InterceptCooldown = TimeSpan.FromMilliseconds(500);
-    private static readonly TimeSpan ClockClickWindow = TimeSpan.FromMilliseconds(1500);
-    private readonly HashSet<IntPtr> _hiddenWindows = new();
+    private static readonly string LogDirectory = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinCal");
+    private static readonly string LogPath = Path.Combine(LogDirectory, "interceptor.log");
 
     // Win32 常量
-    private const uint EVENT_MIN = 0x0001;  // EVENT_MIN
-    private const uint EVENT_OBJECT_SHOW = 0x8002;
-    private const uint EVENT_OBJECT_HIDE = 0x8003;
-    private const uint EVENT_OBJECT_CREATE = 0x8001;
-    private const uint EVENT_OBJECT_UNCLOAK = 0x8018;
-    private const uint EVENT_OBJECT_CLOAK = 0x8017;
-    private const uint EVENT_OBJECT_NAMECHANGE = 0x800C;
-    private const uint EVENT_OBJECT_STATECHANGE = 0x800A;
-    private const uint EVENT_MAX = 0x80FF;
-    private const int WINEVENT_OUTOFCONTEXT = 0;
     private const int WH_MOUSE_LL = 14;
     private const int WM_LBUTTONDOWN = 0x0201;
+    private const int WM_LBUTTONUP = 0x0202;
     private const int WM_RBUTTONDOWN = 0x0204;
     private const int WM_RBUTTONUP = 0x0205;
-    private const int SW_HIDE = 0;
-    private const int SW_SHOW = 5;
+    private const int GA_ROOT = 2;
+    private const double ClockFallbackWidthDip = 100;
+    private const double ClockFallbackRightInsetDip = 4;
 
     // Win32 API
-    [DllImport("user32.dll")]
-    private static extern IntPtr SetWinEventHook(
-        uint eventMin, uint eventMax,
-        IntPtr hmodWinEventProc,
-        WinEventDelegate lpfnWinEventProc,
-        uint idProcess, uint idThread,
-        uint dwFlags);
-
-    [DllImport("user32.dll")]
-    private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
-
-    [DllImport("user32.dll")]
-    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-    [DllImport("user32.dll")]
-    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
     [DllImport("user32.dll")]
     private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
-
-    [DllImport("user32.dll")]
-    private static extern bool IsWindowVisible(IntPtr hWnd);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
-
-    [DllImport("user32.dll")]
-    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetWindowsHookEx(
@@ -113,23 +74,16 @@ public class SystemCalendarInterceptor : IDisposable
     private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
     [DllImport("user32.dll")]
-    private static extern bool GetCursorPos(out POINT lpPoint);
+    private static extern IntPtr WindowFromPoint(POINT point);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(IntPtr hwnd);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr GetModuleHandle(string? lpModuleName);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MONITORINFO
-    {
-        public int cbSize;
-        public RECT rcMonitor;
-        public RECT rcWork;
-        public uint dwFlags;
-    }
-
-    private delegate void WinEventDelegate(
-        IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
-        int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
 
     private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -166,39 +120,28 @@ public class SystemCalendarInterceptor : IDisposable
     /// <summary>
     /// 启动拦截器，传入弹出日历面板的回调
     /// </summary>
-    private static void Log(string msg) => Debug.WriteLine(msg);
+    private static void Log(string msg)
+    {
+        Debug.WriteLine(msg);
+        try
+        {
+            Directory.CreateDirectory(LogDirectory);
+            File.AppendAllText(LogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {msg}{Environment.NewLine}");
+        }
+        catch
+        {
+            // Logging must never affect taskbar input.
+        }
+    }
 
     public void Start(Action showPopupCallback, Action showSystemCalendarCallback)
     {
         _showPopupCallback = showPopupCallback;
         _showSystemCalendarCallback = showSystemCalendarCallback;
 
-        // 使用 GC handle 防止委托被垃圾回收
-        _gcHandle = GCHandle.Alloc(new WinEventDelegate(WinEventProc));
+        // 只监听真实鼠标点击。通知/闹钟等 Shell 窗口不再参与触发判断。
         _mouseGcHandle = GCHandle.Alloc(new LowLevelMouseProc(MouseHookProc));
-
-        // 捕获委托引用
-        var callback = (WinEventDelegate)_gcHandle.Target!;
         var mouseCallback = (LowLevelMouseProc)_mouseGcHandle.Target!;
-
-        // 监听更广范围的事件（捕捉系统日历的各种显示方式）
-        _hook = SetWinEventHook(
-            EVENT_OBJECT_SHOW, EVENT_MAX,
-            IntPtr.Zero, callback,
-            0, 0,
-            WINEVENT_OUTOFCONTEXT);
-
-        if (_hook == IntPtr.Zero)
-        {
-            Log("WinCal: ✗ Failed to set WinEvent hook!");
-        }
-        else
-        {
-            Log("WinCal: ✓ SystemCalendarInterceptor started, hook=" + _hook);
-        }
-
-        // 单独监听真实鼠标左键点击，用来确认系统日历确实由用户点击任务栏时钟触发。
-        // 这比“最近有输入 + 光标恰好在时钟上”更严格，可避免 toast/闹钟误触发。
         _mouseHook = SetWindowsHookEx(
             WH_MOUSE_LL,
             mouseCallback,
@@ -211,7 +154,7 @@ public class SystemCalendarInterceptor : IDisposable
         }
         else
         {
-            Log("WinCal: ✓ Taskbar clock click hook started, hook=" + _mouseHook);
+            Log("WinCal: ✓ Direct taskbar clock mouse hook started, hook=" + _mouseHook);
         }
     }
 
@@ -222,18 +165,34 @@ public class SystemCalendarInterceptor : IDisposable
             if (nCode >= 0)
             {
                 var mouse = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-                if (wParam == (IntPtr)WM_LBUTTONDOWN && IsPointInsideAnyTaskbarClock(mouse.pt))
+                if (wParam == (IntPtr)WM_LBUTTONDOWN)
                 {
-                    _lastTaskbarClockClickTime = DateTime.UtcNow;
-                    Log($"Taskbar clock clicked at ({mouse.pt.X},{mouse.pt.Y})");
+                    var isClock = IsPointInsideAnyTaskbarClock(mouse.pt, logDiagnostics: true);
+                    if (isClock)
+                    {
+                        _suppressClockLeftButtonUp = true;
+                        Log($"Taskbar clock left-clicked at ({mouse.pt.X},{mouse.pt.Y}); opening WinCal directly");
+                        _dispatcher.BeginInvoke(new Action(() => _showPopupCallback?.Invoke()));
+                        return (IntPtr)1;
+                    }
                 }
 
-                if (wParam == (IntPtr)WM_RBUTTONDOWN && IsPointInsideAnyTaskbarClock(mouse.pt))
+                if (wParam == (IntPtr)WM_LBUTTONUP && _suppressClockLeftButtonUp)
                 {
-                    _suppressClockRightButtonUp = true;
-                    Log($"Taskbar clock right-clicked at ({mouse.pt.X},{mouse.pt.Y}); opening Windows notification center");
-                    _dispatcher.BeginInvoke(new Action(() => _showSystemCalendarCallback?.Invoke()));
+                    _suppressClockLeftButtonUp = false;
                     return (IntPtr)1;
+                }
+
+                if (wParam == (IntPtr)WM_RBUTTONDOWN)
+                {
+                    var isClock = IsPointInsideAnyTaskbarClock(mouse.pt, logDiagnostics: true);
+                    if (isClock)
+                    {
+                        _suppressClockRightButtonUp = true;
+                        Log($"Taskbar clock right-clicked at ({mouse.pt.X},{mouse.pt.Y}); opening Windows notification center");
+                        _dispatcher.BeginInvoke(new Action(() => _showSystemCalendarCallback?.Invoke()));
+                        return (IntPtr)1;
+                    }
                 }
 
                 if (wParam == (IntPtr)WM_RBUTTONUP && _suppressClockRightButtonUp)
@@ -251,215 +210,9 @@ public class SystemCalendarInterceptor : IDisposable
         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
     }
 
-    /// <summary>
-    /// WinEvent 回调 —— 在调用者的线程上下文中执行（WINEVENT_OUTOFCONTEXT）
-    /// </summary>
-    private static readonly Dictionary<uint, string> EventTypeNames = new()
+    private static bool IsPointInsideAnyTaskbarClock(POINT point, bool logDiagnostics)
     {
-        [0x8001] = "CREATE",
-        [0x8002] = "SHOW",
-        [0x8003] = "HIDE",
-        [0x8004] = "DESTROY",
-        [0x8006] = "LOCATIONCHANGE",
-        [0x800A] = "STATECHANGE",
-        [0x800C] = "NAMECHANGE",
-        [0x8017] = "CLOAK",
-        [0x8018] = "UNCLOAK",
-    };
-
-    private void WinEventProc(
-        IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
-        int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
-    {
-        try
-        {
-            // 只关心窗口级别的对象（idObject == 0）
-            if (idObject != 0 || hwnd == IntPtr.Zero)
-                return;
-
-            // 获取进程信息来快速过滤
-            GetWindowThreadProcessId(hwnd, out uint processId);
-            string? procName = null;
-            try { procName = Process.GetProcessById((int)processId).ProcessName; } catch { }
-
-            // 记录 ShellExperienceHost 的所有事件
-            if (string.Equals(procName, "ShellExperienceHost", StringComparison.OrdinalIgnoreCase))
-            {
-                var className = new System.Text.StringBuilder(256);
-                GetClassName(hwnd, className, 256);
-                GetWindowRect(hwnd, out var r);
-                var evtName = EventTypeNames.GetValueOrDefault(eventType, $"0x{eventType:X}");
-                Log($"★★★ ShellExperienceHost evt={evtName}(0x{eventType:X}) hwnd={hwnd} idObj={idObject} idChild={idChild} " +
-                    $"Class='{className}' Rect:({r.Left},{r.Top})-({r.Right},{r.Bottom})");
-            }
-
-            // 只处理可能触发的显示事件
-            if (eventType is not (0x8002 or 0x8001 or 0x8018 or 0x800A or 0x800C))
-                return;
-
-            // 检查是否是系统日历/通知中心窗口
-            // 注意：不检查 IsWindowVisible，因为 UNCLOAK 事件时窗口可能尚未完全可见
-            if (!IsSystemCalendarWindow(hwnd))
-                return;
-
-            // 只替换由真实鼠标左键点击任务栏时钟触发的系统面板。
-            // 闹钟、普通 toast、Quick Settings 和 Win+N 都不会建立这个 click token。
-            if (!ConsumeRecentTaskbarClockClick())
-            {
-                Log("ShellExperienceHost candidate ignored: no recent taskbar clock click");
-                return;
-            }
-
-            // 防抖：500ms 内只处理第一次拦截
-            var now = DateTime.UtcNow;
-            if (now - _lastInterceptTime < InterceptCooldown)
-            {
-                Log($"Cooldown: skipping duplicate intercept ({(now - _lastInterceptTime).TotalMilliseconds:F0}ms)");
-                // 仍然隐藏系统窗口
-                ShowWindow(hwnd, SW_HIDE);
-                return;
-            }
-            _lastInterceptTime = now;
-
-            Log($"Detected system calendar window: {hwnd}");
-
-            // 立即隐藏系统日历窗口，并记录句柄以便退出时恢复
-            ShowWindow(hwnd, SW_HIDE);
-            lock (_hiddenWindows)
-            {
-                _hiddenWindows.Add(hwnd);
-            }
-
-            // 在 UI 线程上触发我们的日历面板
-            _dispatcher.BeginInvoke(new Action(() =>
-            {
-                Log("Firing ShowPopup callback on UI thread");
-                _showPopupCallback?.Invoke();
-            }));
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"WinCal: WinEventProc error: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// 判断窗口是否是 Windows 系统日历/通知中心
-    /// </summary>
-    private static bool IsSystemCalendarWindow(IntPtr hwnd)
-    {
-        // 获取进程 ID
-        GetWindowThreadProcessId(hwnd, out uint processId);
-
-        // 获取进程名
-        string? processName = null;
-        try
-        {
-            var proc = Process.GetProcessById((int)processId);
-            processName = proc.ProcessName;
-        }
-        catch
-        {
-            return false;
-        }
-
-        // 调试：记录所有可见窗口
-        var className = new System.Text.StringBuilder(256);
-        GetClassName(hwnd, className, 256);
-        var classStr = className.ToString();
-
-        var title = new System.Text.StringBuilder(256);
-        GetWindowText(hwnd, title, 256);
-
-        GetWindowRect(hwnd, out var rectInfo);
-        Log($"Window shown - PID:{processId}({processName}) " +
-            $"Class:'{classStr}' Title:'{title}' " +
-            $"Rect:({rectInfo.Left},{rectInfo.Top})-({rectInfo.Right},{rectInfo.Bottom})");
-
-        // Windows 11: 系统日历/通知中心属于 ShellExperienceHost 进程
-        // Windows 10: 可能属于 ShellExperienceHost 或 SearchUI
-        if (!string.Equals(processName, "ShellExperienceHost", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        // 系统日历窗口的类名通常是 Windows.UI.Core.CoreWindow
-        // 放宽匹配：只要是右下角的 ShellExperienceHost 窗口就拦截
-        if (!classStr.StartsWith("Windows.UI.Core.CoreWindow", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        // 获取窗口位置 —— 系统日历在屏幕右下角
-        if (!GetWindowRect(hwnd, out var rect))
-            return false;
-
-        var windowWidth = rect.Right - rect.Left;
-        var windowHeight = rect.Bottom - rect.Top;
-
-        // 使用 MonitorFromWindow 获取窗口所在显示器（支持多显示器）
-        var monitor = MonitorFromWindow(hwnd, 0 /* MONITOR_DEFAULTTONULL */);
-        if (monitor == IntPtr.Zero)
-        {
-            Log("ShellExperienceHost: MonitorFromWindow returned null");
-            return false;
-        }
-
-        var monitorInfo = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
-        if (!GetMonitorInfo(monitor, ref monitorInfo))
-        {
-            Log("ShellExperienceHost: GetMonitorInfo failed");
-            return false;
-        }
-
-        var workArea = monitorInfo.rcWork;
-
-        Log($"ShellExperienceHost window - " +
-            $"Size:{windowWidth}x{windowHeight} " +
-            $"Monitor WorkArea:({workArea.Left},{workArea.Top})-({workArea.Right},{workArea.Bottom}) " +
-            $"RightDiff:{Math.Abs(rect.Right - workArea.Right)} " +
-            $"BottomDiff:{Math.Abs(rect.Bottom - workArea.Bottom)}");
-
-        // 系统日历/通知中心窗口特征：
-        // 1. 右边缘贴近显示器工作区右边缘（允许 50px 误差，考虑不同 DPI）
-        // 2. 底部贴近任务栏顶部（允许 50px 误差）
-        // 3. 窗口宽度 > 200px
-        // 4. 窗口高度 > 100px
-        var rightAligned = Math.Abs(rect.Right - workArea.Right) < 50;
-        var bottomAligned = Math.Abs(rect.Bottom - workArea.Bottom) < 50;
-        var validSize = windowWidth > 200 && windowHeight > 100;
-
-        if (rightAligned && bottomAligned && validSize)
-        {
-            Log("✓ System calendar INTERCEPTED!");
-            return true;
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// 消费最近一次真实的任务栏时钟左键点击。
-    /// 一个点击只允许触发一次替换，避免后续无关 ShellExperienceHost 事件复用同一状态。
-    /// </summary>
-    private bool ConsumeRecentTaskbarClockClick()
-    {
-        var clickTime = _lastTaskbarClockClickTime;
-        if (clickTime == default)
-            return false;
-
-        if (DateTime.UtcNow - clickTime > ClockClickWindow)
-        {
-            _lastTaskbarClockClickTime = default;
-            return false;
-        }
-
-        _lastTaskbarClockClickTime = default;
-        return true;
-    }
-
-    private static bool IsPointInsideAnyTaskbarClock(POINT point)
-    {
-        // Windows 11 采用 XAML SystemTray.DateTimeIconContent，通常不会再暴露
-        // 可直接命中的 TrayClockWClass HWND。优先通过 UI Automation 从点击点
-        // 向上查找 DateTimeIconContent；旧 HWND 路径保留给旧版任务栏/兼容模式。
-        if (IsPointInsideWin11TaskbarClock(point))
+        if (IsPointInsideWin11TaskbarClock(point, logDiagnostics))
             return true;
 
         var primaryTaskbar = FindWindow("Shell_TrayWnd", null);
@@ -480,38 +233,56 @@ public class SystemCalendarInterceptor : IDisposable
             return false;
         }, IntPtr.Zero);
 
-        return foundOnSecondaryTaskbar;
+        if (foundOnSecondaryTaskbar)
+            return true;
+
+        return IsPointInsideTaskbarClockFallback(point, logDiagnostics);
     }
 
-    private static bool IsPointInsideWin11TaskbarClock(POINT point)
+    private static bool IsPointInsideWin11TaskbarClock(POINT point, bool logDiagnostics)
     {
         try
         {
             var element = AutomationElement.FromPoint(new System.Windows.Point(point.X, point.Y));
             var walker = TreeWalker.RawViewWalker;
+            var diagnostics = new List<string>();
 
             for (var depth = 0; element != null && depth < 16; depth++)
             {
                 string className;
+                string automationId;
+                string name;
+                ControlType? controlType;
                 try
                 {
                     className = element.Current.ClassName ?? string.Empty;
+                    automationId = element.Current.AutomationId ?? string.Empty;
+                    name = element.Current.Name ?? string.Empty;
+                    controlType = element.Current.ControlType;
                 }
                 catch (ElementNotAvailableException)
                 {
                     return false;
                 }
 
-                if (className.Equals("SystemTray.DateTimeIconContent", StringComparison.OrdinalIgnoreCase) ||
-                    className.Equals("DateTimeIconContent", StringComparison.OrdinalIgnoreCase) ||
-                    className.EndsWith(".DateTimeIconContent", StringComparison.OrdinalIgnoreCase))
+                if (logDiagnostics)
                 {
-                    Log($"Taskbar clock matched via UI Automation: Class='{className}'");
+                    diagnostics.Add(
+                        $"depth={depth} Class='{className}' AutomationId='{automationId}' " +
+                        $"Name='{name}' ControlType='{controlType?.ProgrammaticName ?? ""}'");
+                }
+
+                if (LooksLikeClockElement(className, automationId, name, controlType))
+                {
+                    Log($"Taskbar clock matched via UI Automation: Class='{className}' AutomationId='{automationId}' Name='{name}'");
                     return true;
                 }
 
                 element = walker.GetParent(element);
             }
+
+            if (logDiagnostics && diagnostics.Count > 0)
+                Log($"UIA chain at ({point.X},{point.Y}): {string.Join(" || ", diagnostics)}");
         }
         catch (ElementNotAvailableException)
         {
@@ -524,6 +295,149 @@ public class SystemCalendarInterceptor : IDisposable
         catch (InvalidOperationException ex)
         {
             Log($"WinCal: UI Automation clock hit-test failed: {ex.Message}");
+        }
+
+        return false;
+    }
+
+    private static bool LooksLikeClockElement(
+        string className,
+        string automationId,
+        string name,
+        ControlType? controlType)
+    {
+        if (ContainsClockToken(className) || ContainsClockToken(automationId))
+            return true;
+
+        // Some Windows 11 builds expose the clock as a generic SystemTrayIcon button.
+        // Its accessible name still contains the rendered time (for example "14:39").
+        return controlType == ControlType.Button &&
+               automationId.Equals("SystemTrayIcon", StringComparison.OrdinalIgnoreCase) &&
+               name.Any(char.IsDigit) &&
+               name.Contains(':');
+    }
+
+    private static bool ContainsClockToken(string value) =>
+        value.Contains("DateTime", StringComparison.OrdinalIgnoreCase) ||
+        value.Contains("Clock", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsPointInsideTaskbarClockFallback(POINT point, bool logDiagnostics)
+    {
+        var window = WindowFromPoint(point);
+        if (window == IntPtr.Zero)
+            return false;
+
+        var root = GetAncestor(window, GA_ROOT);
+        if (root == IntPtr.Zero)
+            root = window;
+
+        var rootClass = GetWindowClassName(root);
+        if (!string.Equals(rootClass, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(rootClass, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (IsPointInsideClockDescendant(root, point, logDiagnostics))
+            return true;
+
+        if (!GetWindowRect(root, out var taskbarRect))
+            return false;
+
+        var width = taskbarRect.Right - taskbarRect.Left;
+        var height = taskbarRect.Bottom - taskbarRect.Top;
+        if (width <= height)
+            return false;
+
+        var dpi = GetDpiForWindow(root);
+        var scale = dpi > 0 ? dpi / 96.0 : 1.0;
+        var fallbackWidth = (int)Math.Round(ClockFallbackWidthDip * scale);
+        var rightInset = (int)Math.Round(ClockFallbackRightInsetDip * scale);
+        var left = taskbarRect.Right - rightInset - fallbackWidth;
+        var right = taskbarRect.Right - rightInset;
+
+        var hit = point.X >= left &&
+                  point.X < right &&
+                  point.Y >= taskbarRect.Top &&
+                  point.Y < taskbarRect.Bottom;
+
+        if (logDiagnostics)
+        {
+            Log(
+                $"Taskbar geometry fallback at ({point.X},{point.Y}): rootClass='{rootClass}' " +
+                $"taskbar=({taskbarRect.Left},{taskbarRect.Top})-({taskbarRect.Right},{taskbarRect.Bottom}) " +
+                $"dpi={dpi} clockRangeX=[{left},{right}) hit={hit}");
+        }
+
+        return hit;
+    }
+
+    private static bool IsPointInsideClockDescendant(IntPtr taskbar, POINT point, bool logDiagnostics)
+    {
+        try
+        {
+            var taskbarElement = AutomationElement.FromHandle(taskbar);
+            var descendants = taskbarElement.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+            var containingElements = new List<string>();
+
+            for (var i = 0; i < descendants.Count; i++)
+            {
+                var element = descendants[i];
+                string className;
+                string automationId;
+                string name;
+                ControlType? controlType;
+                System.Windows.Rect bounds;
+
+                try
+                {
+                    className = element.Current.ClassName ?? string.Empty;
+                    automationId = element.Current.AutomationId ?? string.Empty;
+                    name = element.Current.Name ?? string.Empty;
+                    controlType = element.Current.ControlType;
+                    bounds = element.Current.BoundingRectangle;
+                }
+                catch (ElementNotAvailableException)
+                {
+                    continue;
+                }
+
+                if (bounds.IsEmpty ||
+                    point.X < bounds.Left || point.X >= bounds.Right ||
+                    point.Y < bounds.Top || point.Y >= bounds.Bottom)
+                {
+                    continue;
+                }
+
+                if (logDiagnostics && containingElements.Count < 12)
+                {
+                    containingElements.Add(
+                        $"Class='{className}' AutomationId='{automationId}' Name='{name}' " +
+                        $"ControlType='{controlType?.ProgrammaticName ?? ""}' Rect={bounds}");
+                }
+
+                if (!LooksLikeClockElement(className, automationId, name, controlType))
+                    continue;
+
+                Log(
+                    $"Taskbar clock matched via descendant search: Class='{className}' " +
+                    $"AutomationId='{automationId}' Name='{name}' Rect={bounds}");
+                return true;
+            }
+
+            if (logDiagnostics && containingElements.Count > 0)
+                Log($"UIA taskbar descendants containing click: {string.Join(" || ", containingElements)}");
+        }
+        catch (ElementNotAvailableException)
+        {
+        }
+        catch (COMException ex)
+        {
+            Log($"WinCal: UI Automation descendant search failed: 0x{ex.HResult:X8}");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Log($"WinCal: UI Automation descendant search failed: {ex.Message}");
         }
 
         return false;
@@ -553,49 +467,15 @@ public class SystemCalendarInterceptor : IDisposable
             : string.Empty;
     }
 
-    /// <summary>
-    /// 恢复所有被隐藏的系统日历窗口，确保退出后系统日历正常工作
-    /// </summary>
-    public void RestoreHiddenWindows()
-    {
-        lock (_hiddenWindows)
-        {
-            foreach (var hwnd in _hiddenWindows)
-            {
-                try
-                {
-                    ShowWindow(hwnd, SW_SHOW);
-                    Log($"Restored hidden window: {hwnd}");
-                }
-                catch { }
-            }
-            _hiddenWindows.Clear();
-        }
-    }
-
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
 
-        // 退出前恢复被隐藏的系统窗口
-        RestoreHiddenWindows();
-
-        if (_hook != IntPtr.Zero)
-        {
-            UnhookWinEvent(_hook);
-            _hook = IntPtr.Zero;
-        }
-
         if (_mouseHook != IntPtr.Zero)
         {
             UnhookWindowsHookEx(_mouseHook);
             _mouseHook = IntPtr.Zero;
-        }
-
-        if (_gcHandle.IsAllocated)
-        {
-            _gcHandle.Free();
         }
 
         if (_mouseGcHandle.IsAllocated)
