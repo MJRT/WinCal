@@ -27,12 +27,12 @@ jobs:
       - name: Build
         run: dotnet build WinCal.csproj -c Release --no-restore
 
-      - name: Publish self-contained executable
+      - name: Publish framework-dependent executable
         run: >
           dotnet publish WinCal.csproj
           -c Release
           -r win-x64
-          --self-contained true
+          --self-contained false
           --no-restore
           -p:PublishSingleFile=true
           -p:EnableCompressionInSingleFile=true
