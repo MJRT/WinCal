@@ -377,7 +377,9 @@ public class SystemCalendarInterceptor : IDisposable
         try
         {
             var taskbarElement = AutomationElement.FromHandle(taskbar);
-            var descendants = taskbarElement.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+            var descendants = taskbarElement.FindAll(
+                TreeScope.Descendants,
+                System.Windows.Automation.Condition.TrueCondition);
             var containingElements = new List<string>();
 
             for (var i = 0; i < descendants.Count; i++)
