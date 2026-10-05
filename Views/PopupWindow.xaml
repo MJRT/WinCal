@@ -18,10 +18,10 @@
             BorderThickness="1"
             CornerRadius="12"
             ClipToBounds="True"
-            Opacity="1"
+            Opacity="0"
             RenderTransformOrigin="0.5,0.5">
         <Border.RenderTransform>
-            <TranslateTransform x:Name="EntranceTranslate" X="0" />
+            <TranslateTransform x:Name="EntranceTranslate" X="32" />
         </Border.RenderTransform>
 
         <Grid>

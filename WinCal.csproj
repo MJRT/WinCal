@@ -9,7 +9,7 @@
     <!-- <WindowsPackageType>None</WindowsPackageType> -->
     <RootNamespace>WinCal</RootNamespace>
     <AssemblyName>WinCal</AssemblyName>
-    <Version>1.0.10-mjrt</Version>
+    <Version>1.0.11-mjrt</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon />
