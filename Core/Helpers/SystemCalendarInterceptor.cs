@@ -18,9 +18,11 @@ public class SystemCalendarInterceptor : IDisposable
     private GCHandle _mouseGcHandle;
     private readonly Dispatcher _dispatcher;
     private Action? _showPopupCallback;
+    private Action? _showSystemCalendarCallback;
     private bool _disposed;
     private DateTime _lastInterceptTime;
     private DateTime _lastTaskbarClockClickTime;
+    private bool _suppressClockRightButtonUp;
     private static readonly TimeSpan InterceptCooldown = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan ClockClickWindow = TimeSpan.FromMilliseconds(1500);
     private readonly HashSet<IntPtr> _hiddenWindows = new();
@@ -38,6 +40,8 @@ public class SystemCalendarInterceptor : IDisposable
     private const int WINEVENT_OUTOFCONTEXT = 0;
     private const int WH_MOUSE_LL = 14;
     private const int WM_LBUTTONDOWN = 0x0201;
+    private const int WM_RBUTTONDOWN = 0x0204;
+    private const int WM_RBUTTONUP = 0x0205;
     private const int SW_HIDE = 0;
     private const int SW_SHOW = 5;
 
@@ -163,9 +167,10 @@ public class SystemCalendarInterceptor : IDisposable
     /// </summary>
     private static void Log(string msg) => Debug.WriteLine(msg);
 
-    public void Start(Action showPopupCallback)
+    public void Start(Action showPopupCallback, Action showSystemCalendarCallback)
     {
         _showPopupCallback = showPopupCallback;
+        _showSystemCalendarCallback = showSystemCalendarCallback;
 
         // 使用 GC handle 防止委托被垃圾回收
         _gcHandle = GCHandle.Alloc(new WinEventDelegate(WinEventProc));
@@ -213,13 +218,27 @@ public class SystemCalendarInterceptor : IDisposable
     {
         try
         {
-            if (nCode >= 0 && wParam == (IntPtr)WM_LBUTTONDOWN)
+            if (nCode >= 0)
             {
                 var mouse = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-                if (IsPointInsideAnyTaskbarClock(mouse.pt))
+                if (wParam == (IntPtr)WM_LBUTTONDOWN && IsPointInsideAnyTaskbarClock(mouse.pt))
                 {
                     _lastTaskbarClockClickTime = DateTime.UtcNow;
                     Log($"Taskbar clock clicked at ({mouse.pt.X},{mouse.pt.Y})");
+                }
+
+                if (wParam == (IntPtr)WM_RBUTTONDOWN && IsPointInsideAnyTaskbarClock(mouse.pt))
+                {
+                    _suppressClockRightButtonUp = true;
+                    Log($"Taskbar clock right-clicked at ({mouse.pt.X},{mouse.pt.Y}); opening Windows notification center");
+                    _dispatcher.BeginInvoke(new Action(() => _showSystemCalendarCallback?.Invoke()));
+                    return (IntPtr)1;
+                }
+
+                if (wParam == (IntPtr)WM_RBUTTONUP && _suppressClockRightButtonUp)
+                {
+                    _suppressClockRightButtonUp = false;
+                    return (IntPtr)1;
                 }
             }
         }

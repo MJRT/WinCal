@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using System.Runtime.InteropServices;
 using Hardcodet.Wpf.TaskbarNotification;
 using WinCal.Core.Helpers;
 using WinCal.Core.Services;
@@ -13,6 +14,13 @@ public partial class App : Application
     private PopupWindow? _popup;
     private SettingsWindow? _settingsWindow;
     private SystemCalendarInterceptor? _interceptor;
+
+    private const byte VK_LWIN = 0x5B;
+    private const byte VK_N = 0x4E;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -60,7 +68,7 @@ public partial class App : Application
         try
         {
             _interceptor = new SystemCalendarInterceptor(Dispatcher);
-            _interceptor.Start(ShowPopup);
+            _interceptor.Start(ShowPopup, OpenWindowsNotificationCenter);
         }
         catch (Exception ex)
         {
@@ -108,6 +116,26 @@ public partial class App : Application
             System.Diagnostics.Debug.WriteLine("WinCal: OpenSettings dispatcher callback executing");
             ShowSettings();
         }));
+    }
+
+    private void OpenWindowsNotificationCenter()
+    {
+        try
+        {
+            _popup?.Hide();
+
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                keybd_event(VK_LWIN, 0, 0, UIntPtr.Zero);
+                keybd_event(VK_N, 0, 0, UIntPtr.Zero);
+                keybd_event(VK_N, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+            }));
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"WinCal: OpenWindowsNotificationCenter error: {ex}");
+        }
     }
 
     /// <summary>
