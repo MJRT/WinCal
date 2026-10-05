@@ -13,13 +13,16 @@ namespace WinCal.Core.Helpers;
 public class SystemCalendarInterceptor : IDisposable
 {
     private IntPtr _hook;
+    private IntPtr _mouseHook;
     private GCHandle _gcHandle;
+    private GCHandle _mouseGcHandle;
     private readonly Dispatcher _dispatcher;
     private Action? _showPopupCallback;
     private bool _disposed;
     private DateTime _lastInterceptTime;
+    private DateTime _lastTaskbarClockClickTime;
     private static readonly TimeSpan InterceptCooldown = TimeSpan.FromMilliseconds(500);
-    private static readonly TimeSpan ClockInteractionWindow = TimeSpan.FromMilliseconds(1500);
+    private static readonly TimeSpan ClockClickWindow = TimeSpan.FromMilliseconds(1500);
     private readonly HashSet<IntPtr> _hiddenWindows = new();
 
     // Win32 常量
@@ -33,6 +36,8 @@ public class SystemCalendarInterceptor : IDisposable
     private const uint EVENT_OBJECT_STATECHANGE = 0x800A;
     private const uint EVENT_MAX = 0x80FF;
     private const int WINEVENT_OUTOFCONTEXT = 0;
+    private const int WH_MOUSE_LL = 14;
+    private const int WM_LBUTTONDOWN = 0x0201;
     private const int SW_HIDE = 0;
     private const int SW_SHOW = 5;
 
@@ -72,6 +77,23 @@ public class SystemCalendarInterceptor : IDisposable
     [DllImport("user32.dll")]
     private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(
+        int idHook,
+        LowLevelMouseProc lpfn,
+        IntPtr hMod,
+        uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(
+        IntPtr hhk,
+        int nCode,
+        IntPtr wParam,
+        IntPtr lParam);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
 
@@ -88,11 +110,8 @@ public class SystemCalendarInterceptor : IDisposable
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT lpPoint);
 
-    [DllImport("user32.dll")]
-    private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
-
-    [DllImport("kernel32.dll")]
-    private static extern uint GetTickCount();
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr GetModuleHandle(string? lpModuleName);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MONITORINFO
@@ -106,6 +125,8 @@ public class SystemCalendarInterceptor : IDisposable
     private delegate void WinEventDelegate(
         IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
         int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+    private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
 
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
@@ -123,10 +144,13 @@ public class SystemCalendarInterceptor : IDisposable
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct LASTINPUTINFO
+    private struct MSLLHOOKSTRUCT
     {
-        public uint cbSize;
-        public uint dwTime;
+        public POINT pt;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
     }
 
     public SystemCalendarInterceptor(Dispatcher dispatcher)
@@ -145,9 +169,11 @@ public class SystemCalendarInterceptor : IDisposable
 
         // 使用 GC handle 防止委托被垃圾回收
         _gcHandle = GCHandle.Alloc(new WinEventDelegate(WinEventProc));
+        _mouseGcHandle = GCHandle.Alloc(new LowLevelMouseProc(MouseHookProc));
 
         // 捕获委托引用
         var callback = (WinEventDelegate)_gcHandle.Target!;
+        var mouseCallback = (LowLevelMouseProc)_mouseGcHandle.Target!;
 
         // 监听更广范围的事件（捕捉系统日历的各种显示方式）
         _hook = SetWinEventHook(
@@ -164,6 +190,45 @@ public class SystemCalendarInterceptor : IDisposable
         {
             Log("WinCal: ✓ SystemCalendarInterceptor started, hook=" + _hook);
         }
+
+        // 单独监听真实鼠标左键点击，用来确认系统日历确实由用户点击任务栏时钟触发。
+        // 这比“最近有输入 + 光标恰好在时钟上”更严格，可避免 toast/闹钟误触发。
+        _mouseHook = SetWindowsHookEx(
+            WH_MOUSE_LL,
+            mouseCallback,
+            GetModuleHandle(null),
+            0);
+
+        if (_mouseHook == IntPtr.Zero)
+        {
+            Log("WinCal: ✗ Failed to set low-level mouse hook!");
+        }
+        else
+        {
+            Log("WinCal: ✓ Taskbar clock click hook started, hook=" + _mouseHook);
+        }
+    }
+
+    private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        try
+        {
+            if (nCode >= 0 && wParam == (IntPtr)WM_LBUTTONDOWN)
+            {
+                var mouse = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                if (IsPointInsideAnyTaskbarClock(mouse.pt))
+                {
+                    _lastTaskbarClockClickTime = DateTime.UtcNow;
+                    Log($"Taskbar clock clicked at ({mouse.pt.X},{mouse.pt.Y})");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"WinCal: MouseHookProc error: {ex.Message}");
+        }
+
+        return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
     }
 
     /// <summary>
@@ -217,12 +282,11 @@ public class SystemCalendarInterceptor : IDisposable
             if (!IsSystemCalendarWindow(hwnd))
                 return;
 
-            // 只替换由用户点击任务栏时钟触发的系统面板。
-            // 闹钟、普通通知、Quick Settings 和 Win+N 都可能创建形态相近的
-            // ShellExperienceHost 窗口，不能仅根据窗口位置/尺寸判断。
-            if (!IsTaskbarClockInvocation())
+            // 只替换由真实鼠标左键点击任务栏时钟触发的系统面板。
+            // 闹钟、普通 toast、Quick Settings 和 Win+N 都不会建立这个 click token。
+            if (!ConsumeRecentTaskbarClockClick())
             {
-                Log("ShellExperienceHost candidate ignored: no recent taskbar clock interaction");
+                Log("ShellExperienceHost candidate ignored: no recent taskbar clock click");
                 return;
             }
 
@@ -351,17 +415,29 @@ public class SystemCalendarInterceptor : IDisposable
     }
 
     /// <summary>
-    /// 判断当前系统面板是否紧跟在用户点击任务栏时钟之后出现。
-    /// 使用 Explorer 暴露的 TrayClockWClass 精确限定时钟区域，并要求近期存在用户输入，
-    /// 避免 Clock 闹钟、toast、Quick Settings 或 Win+N 误触发 WinCal。
+    /// 消费最近一次真实的任务栏时钟左键点击。
+    /// 一个点击只允许触发一次替换，避免后续无关 ShellExperienceHost 事件复用同一状态。
     /// </summary>
-    private static bool IsTaskbarClockInvocation()
+    private bool ConsumeRecentTaskbarClockClick()
     {
-        if (!WasUserInputRecent() || !GetCursorPos(out var cursor))
+        var clickTime = _lastTaskbarClockClickTime;
+        if (clickTime == default)
             return false;
 
+        if (DateTime.UtcNow - clickTime > ClockClickWindow)
+        {
+            _lastTaskbarClockClickTime = default;
+            return false;
+        }
+
+        _lastTaskbarClockClickTime = default;
+        return true;
+    }
+
+    private static bool IsPointInsideAnyTaskbarClock(POINT point)
+    {
         var primaryTaskbar = FindWindow("Shell_TrayWnd", null);
-        if (primaryTaskbar != IntPtr.Zero && IsPointInsideTaskbarClock(primaryTaskbar, cursor))
+        if (primaryTaskbar != IntPtr.Zero && IsPointInsideTaskbarClock(primaryTaskbar, point))
             return true;
 
         var foundOnSecondaryTaskbar = false;
@@ -371,7 +447,7 @@ public class SystemCalendarInterceptor : IDisposable
             if (!string.Equals(className, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase))
                 return true;
 
-            if (!IsPointInsideTaskbarClock(window, cursor))
+            if (!IsPointInsideTaskbarClock(window, point))
                 return true;
 
             foundOnSecondaryTaskbar = true;
@@ -379,21 +455,6 @@ public class SystemCalendarInterceptor : IDisposable
         }, IntPtr.Zero);
 
         return foundOnSecondaryTaskbar;
-    }
-
-    private static bool WasUserInputRecent()
-    {
-        var lastInput = new LASTINPUTINFO
-        {
-            cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>()
-        };
-
-        if (!GetLastInputInfo(ref lastInput))
-            return false;
-
-        // uint subtraction intentionally handles GetTickCount wraparound.
-        var elapsedMs = unchecked(GetTickCount() - lastInput.dwTime);
-        return elapsedMs <= ClockInteractionWindow.TotalMilliseconds;
     }
 
     private static bool IsPointInsideTaskbarClock(IntPtr taskbar, POINT cursor)
@@ -454,9 +515,20 @@ public class SystemCalendarInterceptor : IDisposable
             _hook = IntPtr.Zero;
         }
 
+        if (_mouseHook != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(_mouseHook);
+            _mouseHook = IntPtr.Zero;
+        }
+
         if (_gcHandle.IsAllocated)
         {
             _gcHandle.Free();
+        }
+
+        if (_mouseGcHandle.IsAllocated)
+        {
+            _mouseGcHandle.Free();
         }
 
         Debug.WriteLine("WinCal: SystemCalendarInterceptor disposed");
