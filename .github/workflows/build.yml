@@ -35,6 +35,9 @@ jobs:
           --self-contained false
           --no-restore
           -p:PublishSingleFile=true
+          -p:PublishReadyToRun=false
+          -p:DebugType=None
+          -p:DebugSymbols=false
           -o dist
 
       - name: Upload executable
@@ -44,14 +47,23 @@ jobs:
           path: dist/WinCal.exe
           if-no-files-found: error
 
+      - name: Package release archive
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: >
+          Compress-Archive
+          -Path dist/WinCal.exe
+          -DestinationPath "dist/WinCal-$env:GITHUB_REF_NAME-win-x64-small.zip"
+
       - name: Create or update GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $asset = "dist/WinCal-$env:GITHUB_REF_NAME-win-x64-small.zip"
           if (gh release view "$env:GITHUB_REF_NAME" 2>$null) {
-            gh release upload "$env:GITHUB_REF_NAME" dist/WinCal.exe --clobber
+            gh release upload "$env:GITHUB_REF_NAME" $asset --clobber
           } else {
-            gh release create "$env:GITHUB_REF_NAME" dist/WinCal.exe --generate-notes --title "$env:GITHUB_REF_NAME"
+            gh release create "$env:GITHUB_REF_NAME" $asset --generate-notes --title "$env:GITHUB_REF_NAME"
           }
