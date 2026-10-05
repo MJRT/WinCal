@@ -26,6 +26,11 @@
     <!-- <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.1.1" /> -->
   </ItemGroup>
 
+  <ItemGroup>
+    <Reference Include="UIAutomationClient" />
+    <Reference Include="UIAutomationTypes" />
+  </ItemGroup>
+
   <!-- 暂时排除需要 Windows SDK (WinRT) 的文件 -->
   <ItemGroup>
     <Compile Remove="Core\Services\WindowsCalendarService.cs" />
