@@ -3,6 +3,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using WinCal.Core.Helpers;
 using WinCal.Core.Models;
@@ -17,6 +18,7 @@ public partial class PopupWindow : Window
     private readonly CalendarViewModel _calendarViewModel;
     private readonly AppSettings _settings;
     private EventDetailWindow? _detailWindow;
+    private static readonly Duration EntranceDuration = new(TimeSpan.FromMilliseconds(200));
 
     public PopupWindow()
     {
@@ -50,6 +52,45 @@ public partial class PopupWindow : Window
     {
         ApplySettings();
         UpdateNoEventsVisibility();
+    }
+
+    /// <summary>
+    /// 播放类似 Windows 原生 flyout 的右侧滑入动画。
+    /// 只动画内容层，避免干扰窗口定位和动态高度计算。
+    /// </summary>
+    public void PlayEntranceAnimation()
+    {
+        RootBorder.BeginAnimation(OpacityProperty, null);
+        EntranceTranslate.BeginAnimation(TranslateTransform.XProperty, null);
+
+        RootBorder.Opacity = 0.2;
+        EntranceTranslate.X = 48;
+
+        var easing = new CubicEase { EasingMode = EasingMode.EaseOut };
+
+        var opacityAnimation = new DoubleAnimation
+        {
+            From = 0.2,
+            To = 1,
+            Duration = EntranceDuration,
+            EasingFunction = easing,
+            FillBehavior = FillBehavior.Stop
+        };
+
+        var slideAnimation = new DoubleAnimation
+        {
+            From = 48,
+            To = 0,
+            Duration = EntranceDuration,
+            EasingFunction = easing,
+            FillBehavior = FillBehavior.Stop
+        };
+
+        opacityAnimation.Completed += (_, _) => RootBorder.Opacity = 1;
+        slideAnimation.Completed += (_, _) => EntranceTranslate.X = 0;
+
+        RootBorder.BeginAnimation(OpacityProperty, opacityAnimation);
+        EntranceTranslate.BeginAnimation(TranslateTransform.XProperty, slideAnimation);
     }
 
     /// <summary>
