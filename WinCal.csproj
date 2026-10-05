@@ -9,7 +9,7 @@
     <!-- <WindowsPackageType>None</WindowsPackageType> -->
     <RootNamespace>WinCal</RootNamespace>
     <AssemblyName>WinCal</AssemblyName>
-    <Version>1.0.5-mjrt</Version>
+    <Version>1.0.6-mjrt</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon />
@@ -24,6 +24,11 @@
     <PackageReference Include="Ical.Net" Version="4.3.1" />
     <!-- 需要安装 Windows 10 SDK 后取消注释以下行 -->
     <!-- <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.1.1" /> -->
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="UIAutomationClient" />
+    <Reference Include="UIAutomationTypes" />
   </ItemGroup>
 
   <!-- 暂时排除需要 Windows SDK (WinRT) 的文件 -->

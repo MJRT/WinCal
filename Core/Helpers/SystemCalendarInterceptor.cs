@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Threading;
 
 namespace WinCal.Core.Helpers;
@@ -455,6 +456,12 @@ public class SystemCalendarInterceptor : IDisposable
 
     private static bool IsPointInsideAnyTaskbarClock(POINT point)
     {
+        // Windows 11 采用 XAML SystemTray.DateTimeIconContent，通常不会再暴露
+        // 可直接命中的 TrayClockWClass HWND。优先通过 UI Automation 从点击点
+        // 向上查找 DateTimeIconContent；旧 HWND 路径保留给旧版任务栏/兼容模式。
+        if (IsPointInsideWin11TaskbarClock(point))
+            return true;
+
         var primaryTaskbar = FindWindow("Shell_TrayWnd", null);
         if (primaryTaskbar != IntPtr.Zero && IsPointInsideTaskbarClock(primaryTaskbar, point))
             return true;
@@ -474,6 +481,52 @@ public class SystemCalendarInterceptor : IDisposable
         }, IntPtr.Zero);
 
         return foundOnSecondaryTaskbar;
+    }
+
+    private static bool IsPointInsideWin11TaskbarClock(POINT point)
+    {
+        try
+        {
+            var element = AutomationElement.FromPoint(new System.Windows.Point(point.X, point.Y));
+            var walker = TreeWalker.RawViewWalker;
+
+            for (var depth = 0; element != null && depth < 16; depth++)
+            {
+                string className;
+                try
+                {
+                    className = element.Current.ClassName ?? string.Empty;
+                }
+                catch (ElementNotAvailableException)
+                {
+                    return false;
+                }
+
+                if (className.Equals("SystemTray.DateTimeIconContent", StringComparison.OrdinalIgnoreCase) ||
+                    className.Equals("DateTimeIconContent", StringComparison.OrdinalIgnoreCase) ||
+                    className.EndsWith(".DateTimeIconContent", StringComparison.OrdinalIgnoreCase))
+                {
+                    Log($"Taskbar clock matched via UI Automation: Class='{className}'");
+                    return true;
+                }
+
+                element = walker.GetParent(element);
+            }
+        }
+        catch (ElementNotAvailableException)
+        {
+            // Taskbar UI can rebuild its XAML tree while hit-testing.
+        }
+        catch (COMException ex)
+        {
+            Log($"WinCal: UI Automation clock hit-test failed: 0x{ex.HResult:X8}");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Log($"WinCal: UI Automation clock hit-test failed: {ex.Message}");
+        }
+
+        return false;
     }
 
     private static bool IsPointInsideTaskbarClock(IntPtr taskbar, POINT cursor)
