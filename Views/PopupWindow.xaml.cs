@@ -18,7 +18,7 @@ public partial class PopupWindow : Window
     private readonly CalendarViewModel _calendarViewModel;
     private readonly AppSettings _settings;
     private EventDetailWindow? _detailWindow;
-    private static readonly Duration EntranceDuration = new(TimeSpan.FromMilliseconds(200));
+    private static readonly Duration EntranceDuration = new(TimeSpan.FromMilliseconds(167));
 
     public PopupWindow()
     {
@@ -40,6 +40,7 @@ public partial class PopupWindow : Window
         _calendarViewModel.UpcomingEvents.CollectionChanged += (_, _) => UpdateNoEventsVisibility();
 
         Loaded += OnLoaded;
+        ContentRendered += OnContentRendered;
 
         // 窗口尺寸变化时重新定位（异步加载事件后窗口变高）
         SizeChanged += OnSizeChanged;
@@ -54,40 +55,37 @@ public partial class PopupWindow : Window
         UpdateNoEventsVisibility();
     }
 
-    /// <summary>
-    /// 播放类似 Windows 原生 flyout 的右侧滑入动画。
-    /// 只动画内容层，避免干扰窗口定位和动态高度计算。
-    /// </summary>
-    public void PlayEntranceAnimation()
+    private void OnContentRendered(object? sender, EventArgs e)
     {
-        RootBorder.BeginAnimation(OpacityProperty, null);
-        EntranceTranslate.BeginAnimation(TranslateTransform.XProperty, null);
+        ContentRendered -= OnContentRendered;
+        PlayEntranceAnimation();
+    }
 
-        RootBorder.Opacity = 0.2;
-        EntranceTranslate.X = 48;
-
+    /// <summary>
+    /// 播放类似 Windows 原生 flyout 的短距离右侧滑入 + 淡入。
+    /// 初始状态已在 XAML 中预设，因此首帧不会先完整显示再回跳。
+    /// </summary>
+    private void PlayEntranceAnimation()
+    {
         var easing = new CubicEase { EasingMode = EasingMode.EaseOut };
 
         var opacityAnimation = new DoubleAnimation
         {
-            From = 0.2,
+            From = 0,
             To = 1,
             Duration = EntranceDuration,
             EasingFunction = easing,
-            FillBehavior = FillBehavior.Stop
+            FillBehavior = FillBehavior.HoldEnd
         };
 
         var slideAnimation = new DoubleAnimation
         {
-            From = 48,
+            From = 32,
             To = 0,
             Duration = EntranceDuration,
             EasingFunction = easing,
-            FillBehavior = FillBehavior.Stop
+            FillBehavior = FillBehavior.HoldEnd
         };
-
-        opacityAnimation.Completed += (_, _) => RootBorder.Opacity = 1;
-        slideAnimation.Completed += (_, _) => EntranceTranslate.X = 0;
 
         RootBorder.BeginAnimation(OpacityProperty, opacityAnimation);
         EntranceTranslate.BeginAnimation(TranslateTransform.XProperty, slideAnimation);

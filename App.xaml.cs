@@ -179,7 +179,6 @@ public partial class App : Application
             _popup.Show();
             WindowPositionHelper.PositionNearTaskbar(_popup);
             _popup.Activate();
-            _popup.PlayEntranceAnimation();
             _popup.StartFocusTracking();
         }
         catch (Exception ex)
