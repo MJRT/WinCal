@@ -158,7 +158,7 @@ public partial class App : Application
     /// 切换 WinCal 面板。
     /// WinCal 已显示时再次左键会隐藏；若原生通知中心正在前台，则先关闭原生面板再显示 WinCal。
     /// </summary>
-    private void TogglePopup()
+    private async void TogglePopup()
     {
         try
         {
@@ -168,7 +168,11 @@ public partial class App : Application
                 return;
             }
 
-            CloseNativeShellFlyoutIfForeground();
+            if (IsNativeShellFlyoutForeground())
+            {
+                CloseNativeShellFlyoutIfForeground();
+                await WaitForNativeShellFlyoutToCloseAsync();
+            }
 
             _popup?.Close();
             _popup = new PopupWindow();
@@ -181,6 +185,24 @@ public partial class App : Application
         {
             System.Diagnostics.Debug.WriteLine($"WinCal: TogglePopup error: {ex}");
             _popup = null;
+        }
+    }
+
+    private static async Task WaitForNativeShellFlyoutToCloseAsync()
+    {
+        // Windows closes the notification/calendar flyout asynchronously.
+        // Wait until it has actually left the foreground before activating WinCal,
+        // otherwise PopupWindow.OnDeactivated can immediately hide the new popup.
+        for (var attempt = 0; attempt < 12; attempt++)
+        {
+            if (!IsNativeShellFlyoutForeground())
+            {
+                // Allow the shell one more message turn to finish returning focus.
+                await Task.Delay(50);
+                return;
+            }
+
+            await Task.Delay(50);
         }
     }
 
