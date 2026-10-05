@@ -17,8 +17,8 @@ public class SystemCalendarInterceptor : IDisposable
     private IntPtr _mouseHook;
     private GCHandle _mouseGcHandle;
     private readonly Dispatcher _dispatcher;
-    private Action? _showPopupCallback;
-    private Action? _showSystemCalendarCallback;
+    private Action? _toggleWinCalCallback;
+    private Action? _toggleSystemCalendarCallback;
     private bool _disposed;
     private bool _suppressClockLeftButtonUp;
     private bool _suppressClockRightButtonUp;
@@ -134,10 +134,10 @@ public class SystemCalendarInterceptor : IDisposable
         }
     }
 
-    public void Start(Action showPopupCallback, Action showSystemCalendarCallback)
+    public void Start(Action toggleWinCalCallback, Action toggleSystemCalendarCallback)
     {
-        _showPopupCallback = showPopupCallback;
-        _showSystemCalendarCallback = showSystemCalendarCallback;
+        _toggleWinCalCallback = toggleWinCalCallback;
+        _toggleSystemCalendarCallback = toggleSystemCalendarCallback;
 
         // 只监听真实鼠标点击。通知/闹钟等 Shell 窗口不再参与触发判断。
         _mouseGcHandle = GCHandle.Alloc(new LowLevelMouseProc(MouseHookProc));
@@ -171,8 +171,8 @@ public class SystemCalendarInterceptor : IDisposable
                     if (isClock)
                     {
                         _suppressClockLeftButtonUp = true;
-                        Log($"Taskbar clock left-clicked at ({mouse.pt.X},{mouse.pt.Y}); opening WinCal directly");
-                        _dispatcher.BeginInvoke(new Action(() => _showPopupCallback?.Invoke()));
+                        Log($"Taskbar clock left-clicked at ({mouse.pt.X},{mouse.pt.Y}); toggling WinCal");
+                        _dispatcher.BeginInvoke(new Action(() => _toggleWinCalCallback?.Invoke()));
                         return (IntPtr)1;
                     }
                 }
@@ -189,8 +189,8 @@ public class SystemCalendarInterceptor : IDisposable
                     if (isClock)
                     {
                         _suppressClockRightButtonUp = true;
-                        Log($"Taskbar clock right-clicked at ({mouse.pt.X},{mouse.pt.Y}); opening Windows notification center");
-                        _dispatcher.BeginInvoke(new Action(() => _showSystemCalendarCallback?.Invoke()));
+                        Log($"Taskbar clock right-clicked at ({mouse.pt.X},{mouse.pt.Y}); toggling Windows notification center");
+                        _dispatcher.BeginInvoke(new Action(() => _toggleSystemCalendarCallback?.Invoke()));
                         return (IntPtr)1;
                     }
                 }
