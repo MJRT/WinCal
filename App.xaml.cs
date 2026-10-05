@@ -1,6 +1,8 @@
 using System.Windows;
 using System.Windows.Controls;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using Hardcodet.Wpf.TaskbarNotification;
 using WinCal.Core.Helpers;
 using WinCal.Core.Services;
@@ -17,10 +19,20 @@ public partial class App : Application
 
     private const byte VK_LWIN = 0x5B;
     private const byte VK_N = 0x4E;
+    private const byte VK_ESCAPE = 0x1B;
     private const uint KEYEVENTF_KEYUP = 0x0002;
 
     [DllImport("user32.dll")]
     private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -68,7 +80,7 @@ public partial class App : Application
         try
         {
             _interceptor = new SystemCalendarInterceptor(Dispatcher);
-            _interceptor.Start(ShowPopup, OpenWindowsNotificationCenter);
+            _interceptor.Start(TogglePopup, ToggleWindowsNotificationCenter);
         }
         catch (Exception ex)
         {
@@ -118,14 +130,18 @@ public partial class App : Application
         }));
     }
 
-    private void OpenWindowsNotificationCenter()
+    private void ToggleWindowsNotificationCenter()
     {
         try
         {
-            _popup?.Hide();
+            // WinCal 和原生通知中心互斥：右键切到原生面板前先隐藏 WinCal。
+            if (_popup != null && _popup.IsVisible)
+                _popup.Hide();
 
             Dispatcher.BeginInvoke(new Action(() =>
             {
+                // Win+N 本身就是原生通知中心的 toggle：
+                // 已显示时关闭，未显示时打开。
                 keybd_event(VK_LWIN, 0, 0, UIntPtr.Zero);
                 keybd_event(VK_N, 0, 0, UIntPtr.Zero);
                 keybd_event(VK_N, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
@@ -134,69 +150,85 @@ public partial class App : Application
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"WinCal: OpenWindowsNotificationCenter error: {ex}");
+            System.Diagnostics.Debug.WriteLine($"WinCal: ToggleWindowsNotificationCenter error: {ex}");
         }
     }
 
     /// <summary>
-    /// 显示日历面板（不切换，始终显示）。用于拦截器回调。
+    /// 切换 WinCal 面板。
+    /// WinCal 已显示时再次左键会隐藏；若原生通知中心正在前台，则先关闭原生面板再显示 WinCal。
     /// </summary>
-    private void ShowPopup()
+    private void TogglePopup()
     {
         try
         {
             if (_popup != null && _popup.IsVisible)
             {
-                // 已显示则只激活，不重新创建
-                _popup.Activate();
+                _popup.Hide();
                 return;
             }
+
+            CloseNativeShellFlyoutIfForeground();
 
             _popup?.Close();
             _popup = new PopupWindow();
             _popup.Show();
             WindowPositionHelper.PositionNearTaskbar(_popup);
             _popup.Activate();
-
-            // 延迟启动焦点跟踪定时器，给窗口时间获取焦点
-            Dispatcher.BeginInvoke(new Action(() =>
-            {
-                _popup?.StartFocusTracking();
-            }), System.Windows.Threading.DispatcherPriority.Loaded);
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"WinCal: ShowPopup error: {ex}");
-            _popup = null;
-        }
-    }
-
-    /// <summary>
-    /// 切换日历面板显示/隐藏。用于托盘图标点击。
-    /// </summary>
-    private void TogglePopup()
-    {
-        try
-        {
-            if (_popup == null || !_popup.IsVisible)
-            {
-                _popup?.Close();
-                _popup = new PopupWindow();
-                _popup.Show();
-                WindowPositionHelper.PositionNearTaskbar(_popup);
-                _popup.Activate();
-                _popup.StartFocusTracking();
-            }
-            else
-            {
-                _popup.Hide();
-            }
+            _popup.StartFocusTracking();
         }
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"WinCal: TogglePopup error: {ex}");
             _popup = null;
         }
+    }
+
+    private static void CloseNativeShellFlyoutIfForeground()
+    {
+        if (!IsNativeShellFlyoutForeground())
+            return;
+
+        keybd_event(VK_ESCAPE, 0, 0, UIntPtr.Zero);
+        keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+    }
+
+    private static bool IsNativeShellFlyoutForeground()
+    {
+        var hwnd = GetForegroundWindow();
+        if (hwnd == IntPtr.Zero)
+            return false;
+
+        var className = new StringBuilder(256);
+        if (GetClassName(hwnd, className, className.Capacity) <= 0)
+            return false;
+
+        GetWindowThreadProcessId(hwnd, out var processId);
+        if (processId == 0)
+            return false;
+
+        string processName;
+        try
+        {
+            processName = Process.GetProcessById((int)processId).ProcessName;
+        }
+        catch
+        {
+            return false;
+        }
+
+        var classText = className.ToString();
+
+        // Windows 11 24H2+.
+        if (processName.Equals("ShellHost", StringComparison.OrdinalIgnoreCase) &&
+            classText.Equals("ControlCenterWindow", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // Windows 11 21H2-23H2 and compatible ShellExperienceHost paths.
+        return processName.Equals("ShellExperienceHost", StringComparison.OrdinalIgnoreCase) &&
+               classText.StartsWith("Windows.UI.Core.CoreWindow", StringComparison.OrdinalIgnoreCase);
     }
 
     protected override void OnExit(ExitEventArgs e)
