@@ -35,7 +35,6 @@ jobs:
           --self-contained false
           --no-restore
           -p:PublishSingleFile=true
-          -p:EnableCompressionInSingleFile=true
           -o dist
 
       - name: Upload executable
