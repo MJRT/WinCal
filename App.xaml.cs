@@ -34,7 +34,19 @@ public partial class App : Application
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
-    protected override void OnStartup(StartupEventArgs e)
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left, Top, Right, Bottom;
+    }
+
+    protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
 
@@ -45,46 +57,85 @@ public partial class App : Application
             args.Handled = true;
         };
 
-        // 初始化托盘图标
-        _trayIcon = (TaskbarIcon)FindResource("TrayIcon")!;
-
-        // 左键点击弹出日历
-        _trayIcon.TrayLeftMouseDown += (s, args) => TogglePopup();
-
-        // 动态生成带今日日期数字的图标
-        _trayIcon.Icon = TrayIconGenerator.Generate(DateTime.Today.Day);
-
-        // 更新托盘提示文本
-        _trayIcon.ToolTipText = $"miniCal - {DateTime.Now:yyyy年M月d日 dddd}";
-
         // 应用保存的主题设置
         var settings = AppSettings.Load();
         ThemeHelper.ApplyTheme(settings.ThemeMode);
 
-        // 动态创建右键菜单
-        var menu = new ContextMenu();
+        // Keep the Run entry pointed at the executable that is actually running.
+        // This also migrates older registrations that did not include --startup.
+        if (settings.AutoStartup)
+            StartupHelper.Enable();
 
+        var isLogonStartup = e.Args.Any(arg =>
+            string.Equals(arg, StartupHelper.StartupArgument, StringComparison.OrdinalIgnoreCase));
+
+        if (isLogonStartup)
+            await WaitForExplorerTaskbarAsync();
+
+        InitializeTrayIcon();
+        await InitializeTaskbarInterceptorAsync();
+    }
+
+    private void InitializeTrayIcon()
+    {
+        if (_trayIcon != null)
+            return;
+
+        _trayIcon = (TaskbarIcon)FindResource("TrayIcon")!;
+        _trayIcon.TrayLeftMouseDown += (s, args) => TogglePopup();
+        _trayIcon.Icon = TrayIconGenerator.Generate(DateTime.Today.Day);
+        _trayIcon.ToolTipText = $"miniCal - {DateTime.Now:yyyy年M月d日 dddd}";
+
+        var menu = new ContextMenu();
         var settingsItem = new MenuItem { Header = "设置" };
         settingsItem.Click += (s, args) => OpenSettings();
         menu.Items.Add(settingsItem);
-
         menu.Items.Add(new Separator());
-
         var exitItem = new MenuItem { Header = "退出" };
         exitItem.Click += (s, args) => Shutdown();
         menu.Items.Add(exitItem);
-
         _trayIcon.ContextMenu = menu;
+    }
 
-        // 启动系统日历拦截器：点击任务栏时钟时替换为我们的面板
-        try
+    private async Task InitializeTaskbarInterceptorAsync()
+    {
+        for (var attempt = 0; attempt < 10; attempt++)
         {
-            _interceptor = new SystemCalendarInterceptor(Dispatcher);
-            _interceptor.Start(TogglePopup, ToggleWindowsNotificationCenter);
+            try
+            {
+                _interceptor?.Dispose();
+                _interceptor = new SystemCalendarInterceptor(Dispatcher);
+                if (_interceptor.Start(TogglePopup, ToggleWindowsNotificationCenter))
+                    return;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"WinCal: Interceptor start attempt {attempt + 1} failed: {ex.Message}");
+            }
+
+            await Task.Delay(500);
         }
-        catch (Exception ex)
+
+        System.Diagnostics.Debug.WriteLine("WinCal: Failed to initialize taskbar interceptor after retries.");
+    }
+
+    private static async Task WaitForExplorerTaskbarAsync()
+    {
+        for (var attempt = 0; attempt < 200; attempt++)
         {
-            System.Diagnostics.Debug.WriteLine($"WinCal: Interceptor failed: {ex.Message}");
+            var taskbar = FindWindow("Shell_TrayWnd", null);
+            if (taskbar != IntPtr.Zero &&
+                GetWindowRect(taskbar, out var rect) &&
+                rect.Right > rect.Left &&
+                rect.Bottom > rect.Top)
+            {
+                // Explorer's top-level taskbar exists. Give its XAML system tray
+                // a short stabilization window before creating NotifyIcon/UIA state.
+                await Task.Delay(500);
+                return;
+            }
+
+            await Task.Delay(100);
         }
     }
 

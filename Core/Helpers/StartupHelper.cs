@@ -9,6 +9,10 @@ public static class StartupHelper
 {
     private const string AppName = "miniCal";
     private const string RunKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+    public const string StartupArgument = "--startup";
+
+    private static string StartupCommand =>
+        $"\"{Environment.ProcessPath}\" {StartupArgument}";
 
     /// <summary>
     /// 启用开机自启动
@@ -18,7 +22,7 @@ public static class StartupHelper
         try
         {
             using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true);
-            key?.SetValue(AppName, Environment.ProcessPath!);
+            key?.SetValue(AppName, StartupCommand);
         }
         catch (Exception ex)
         {
@@ -51,7 +55,8 @@ public static class StartupHelper
         {
             using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);
             var value = key?.GetValue(AppName) as string;
-            return value == Environment.ProcessPath;
+            return string.Equals(value, StartupCommand, StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value?.Trim('"'), Environment.ProcessPath, StringComparison.OrdinalIgnoreCase);
         }
         catch
         {
