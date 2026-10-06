@@ -22,6 +22,8 @@ public class SystemCalendarInterceptor : IDisposable
     private bool _disposed;
     private bool _suppressClockLeftButtonUp;
     private bool _suppressClockRightButtonUp;
+    private readonly object _clockRectsLock = new();
+    private List<RECT> _clockRects = new();
     private static readonly string LogDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinCal");
     private static readonly string LogPath = Path.Combine(LogDirectory, "interceptor.log");
@@ -134,10 +136,14 @@ public class SystemCalendarInterceptor : IDisposable
         }
     }
 
-    public void Start(Action toggleWinCalCallback, Action toggleSystemCalendarCallback)
+    public bool Start(Action toggleWinCalCallback, Action toggleSystemCalendarCallback)
     {
         _toggleWinCalCallback = toggleWinCalCallback;
         _toggleSystemCalendarCallback = toggleSystemCalendarCallback;
+
+        // Resolve the taskbar clock while Explorer is stable. UI Automation can be
+        // relatively expensive, so it must never run inside WH_MOUSE_LL.
+        RefreshClockHitRects();
 
         // 只监听真实鼠标点击。通知/闹钟等 Shell 窗口不再参与触发判断。
         _mouseGcHandle = GCHandle.Alloc(new LowLevelMouseProc(MouseHookProc));
@@ -151,11 +157,12 @@ public class SystemCalendarInterceptor : IDisposable
         if (_mouseHook == IntPtr.Zero)
         {
             Log("WinCal: ✗ Failed to set low-level mouse hook!");
+            _mouseGcHandle.Free();
+            return false;
         }
-        else
-        {
-            Log("WinCal: ✓ Direct taskbar clock mouse hook started, hook=" + _mouseHook);
-        }
+
+        Log("WinCal: ✓ Direct taskbar clock mouse hook started, hook=" + _mouseHook);
+        return true;
     }
 
     private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
@@ -167,12 +174,16 @@ public class SystemCalendarInterceptor : IDisposable
                 var mouse = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
                 if (wParam == (IntPtr)WM_LBUTTONDOWN)
                 {
-                    var isClock = IsPointInsideAnyTaskbarClock(mouse.pt, logDiagnostics: true);
+                    var isClock = IsPointInsideCachedClock(mouse.pt) ||
+                                  IsPointInsideTaskbarClockFallback(mouse.pt);
                     if (isClock)
                     {
                         _suppressClockLeftButtonUp = true;
-                        Log($"Taskbar clock left-clicked at ({mouse.pt.X},{mouse.pt.Y}); toggling WinCal");
-                        _dispatcher.BeginInvoke(new Action(() => _toggleWinCalCallback?.Invoke()));
+                        _dispatcher.BeginInvoke(new Action(() =>
+                        {
+                            Log($"Taskbar clock left-clicked at ({mouse.pt.X},{mouse.pt.Y}); toggling WinCal");
+                            _toggleWinCalCallback?.Invoke();
+                        }));
                         return (IntPtr)1;
                     }
                 }
@@ -185,12 +196,16 @@ public class SystemCalendarInterceptor : IDisposable
 
                 if (wParam == (IntPtr)WM_RBUTTONDOWN)
                 {
-                    var isClock = IsPointInsideAnyTaskbarClock(mouse.pt, logDiagnostics: true);
+                    var isClock = IsPointInsideCachedClock(mouse.pt) ||
+                                  IsPointInsideTaskbarClockFallback(mouse.pt);
                     if (isClock)
                     {
                         _suppressClockRightButtonUp = true;
-                        Log($"Taskbar clock right-clicked at ({mouse.pt.X},{mouse.pt.Y}); toggling Windows notification center");
-                        _dispatcher.BeginInvoke(new Action(() => _toggleSystemCalendarCallback?.Invoke()));
+                        _dispatcher.BeginInvoke(new Action(() =>
+                        {
+                            Log($"Taskbar clock right-clicked at ({mouse.pt.X},{mouse.pt.Y}); toggling Windows notification center");
+                            _toggleSystemCalendarCallback?.Invoke();
+                        }));
                         return (IntPtr)1;
                     }
                 }
@@ -204,100 +219,115 @@ public class SystemCalendarInterceptor : IDisposable
         }
         catch (Exception ex)
         {
-            Log($"WinCal: MouseHookProc error: {ex.Message}");
+            // Never perform file I/O from WH_MOUSE_LL.
+            Debug.WriteLine($"WinCal: MouseHookProc error: {ex.Message}");
         }
 
         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
     }
 
-    private static bool IsPointInsideAnyTaskbarClock(POINT point, bool logDiagnostics)
+    private bool IsPointInsideCachedClock(POINT point)
     {
-        if (IsPointInsideWin11TaskbarClock(point, logDiagnostics))
-            return true;
-
-        var primaryTaskbar = FindWindow("Shell_TrayWnd", null);
-        if (primaryTaskbar != IntPtr.Zero && IsPointInsideTaskbarClock(primaryTaskbar, point))
-            return true;
-
-        var foundOnSecondaryTaskbar = false;
-        EnumWindows((window, _) =>
+        lock (_clockRectsLock)
         {
-            var className = GetWindowClassName(window);
-            if (!string.Equals(className, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase))
-                return true;
-
-            if (!IsPointInsideTaskbarClock(window, point))
-                return true;
-
-            foundOnSecondaryTaskbar = true;
-            return false;
-        }, IntPtr.Zero);
-
-        if (foundOnSecondaryTaskbar)
-            return true;
-
-        return IsPointInsideTaskbarClockFallback(point, logDiagnostics);
+            return _clockRects.Any(rect =>
+                point.X >= rect.Left && point.X < rect.Right &&
+                point.Y >= rect.Top && point.Y < rect.Bottom);
+        }
     }
 
-    private static bool IsPointInsideWin11TaskbarClock(POINT point, bool logDiagnostics)
+    private void RefreshClockHitRects()
     {
-        try
+        var rects = new List<RECT>();
+        var taskbars = new List<IntPtr>();
+
+        var primaryTaskbar = FindWindow("Shell_TrayWnd", null);
+        if (primaryTaskbar != IntPtr.Zero)
+            taskbars.Add(primaryTaskbar);
+
+        EnumWindows((window, _) =>
         {
-            var element = AutomationElement.FromPoint(new System.Windows.Point(point.X, point.Y));
-            var walker = TreeWalker.RawViewWalker;
-            var diagnostics = new List<string>();
-
-            for (var depth = 0; element != null && depth < 16; depth++)
+            if (string.Equals(
+                    GetWindowClassName(window),
+                    "Shell_SecondaryTrayWnd",
+                    StringComparison.OrdinalIgnoreCase))
             {
-                string className;
-                string automationId;
-                string name;
-                ControlType? controlType;
-                try
-                {
-                    className = element.Current.ClassName ?? string.Empty;
-                    automationId = element.Current.AutomationId ?? string.Empty;
-                    name = element.Current.Name ?? string.Empty;
-                    controlType = element.Current.ControlType;
-                }
-                catch (ElementNotAvailableException)
-                {
-                    return false;
-                }
+                taskbars.Add(window);
+            }
+            return true;
+        }, IntPtr.Zero);
 
-                if (logDiagnostics)
-                {
-                    diagnostics.Add(
-                        $"depth={depth} Class='{className}' AutomationId='{automationId}' " +
-                        $"Name='{name}' ControlType='{controlType?.ProgrammaticName ?? ""}'");
-                }
+        foreach (var taskbar in taskbars.Distinct())
+        {
+            var countBefore = rects.Count;
 
-                if (LooksLikeClockElement(className, automationId, name, controlType))
-                {
-                    Log($"Taskbar clock matched via UI Automation: Class='{className}' AutomationId='{automationId}' Name='{name}'");
-                    return true;
-                }
-
-                element = walker.GetParent(element);
+            var trayNotify = FindWindowEx(taskbar, IntPtr.Zero, "TrayNotifyWnd", null);
+            if (trayNotify != IntPtr.Zero)
+            {
+                var legacyClock = FindWindowEx(trayNotify, IntPtr.Zero, "TrayClockWClass", null);
+                if (legacyClock != IntPtr.Zero && GetWindowRect(legacyClock, out var legacyRect))
+                    rects.Add(legacyRect);
             }
 
-            if (logDiagnostics && diagnostics.Count > 0)
-                Log($"UIA chain at ({point.X},{point.Y}): {string.Join(" || ", diagnostics)}");
-        }
-        catch (ElementNotAvailableException)
-        {
-            // Taskbar UI can rebuild its XAML tree while hit-testing.
-        }
-        catch (COMException ex)
-        {
-            Log($"WinCal: UI Automation clock hit-test failed: 0x{ex.HResult:X8}");
-        }
-        catch (InvalidOperationException ex)
-        {
-            Log($"WinCal: UI Automation clock hit-test failed: {ex.Message}");
+            try
+            {
+                var taskbarElement = AutomationElement.FromHandle(taskbar);
+                var descendants = taskbarElement.FindAll(
+                    TreeScope.Descendants,
+                    System.Windows.Automation.Condition.TrueCondition);
+
+                for (var i = 0; i < descendants.Count; i++)
+                {
+                    var element = descendants[i];
+                    string className;
+                    string automationId;
+                    string name;
+                    ControlType? controlType;
+                    System.Windows.Rect bounds;
+
+                    try
+                    {
+                        className = element.Current.ClassName ?? string.Empty;
+                        automationId = element.Current.AutomationId ?? string.Empty;
+                        name = element.Current.Name ?? string.Empty;
+                        controlType = element.Current.ControlType;
+                        bounds = element.Current.BoundingRectangle;
+                    }
+                    catch (ElementNotAvailableException)
+                    {
+                        continue;
+                    }
+
+                    if (!LooksLikeClockElement(className, automationId, name, controlType) ||
+                        bounds.IsEmpty ||
+                        bounds.Width <= 0 ||
+                        bounds.Height <= 0)
+                    {
+                        continue;
+                    }
+
+                    rects.Add(new RECT
+                    {
+                        Left = (int)Math.Floor(bounds.Left),
+                        Top = (int)Math.Floor(bounds.Top),
+                        Right = (int)Math.Ceiling(bounds.Right),
+                        Bottom = (int)Math.Ceiling(bounds.Bottom)
+                    });
+                }
+            }
+            catch (Exception ex) when (ex is ElementNotAvailableException or COMException or InvalidOperationException)
+            {
+                Log($"WinCal: Clock UIA cache refresh failed: {ex.Message}");
+            }
+
+            if (rects.Count == countBefore && TryGetTaskbarClockFallbackRect(taskbar, out var fallbackRect))
+                rects.Add(fallbackRect);
         }
 
-        return false;
+        lock (_clockRectsLock)
+            _clockRects = rects;
+
+        Log($"WinCal: Cached {rects.Count} taskbar clock hit region(s).");
     }
 
     private static bool LooksLikeClockElement(
@@ -321,7 +351,7 @@ public class SystemCalendarInterceptor : IDisposable
         value.Contains("DateTime", StringComparison.OrdinalIgnoreCase) ||
         value.Contains("Clock", StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsPointInsideTaskbarClockFallback(POINT point, bool logDiagnostics)
+    private static bool IsPointInsideTaskbarClockFallback(POINT point)
     {
         var window = WindowFromPoint(point);
         if (window == IntPtr.Zero)
@@ -338,10 +368,20 @@ public class SystemCalendarInterceptor : IDisposable
             return false;
         }
 
-        if (IsPointInsideClockDescendant(root, point, logDiagnostics))
-            return true;
+        if (!TryGetTaskbarClockFallbackRect(root, out var fallbackRect))
+            return false;
 
-        if (!GetWindowRect(root, out var taskbarRect))
+        return point.X >= fallbackRect.Left &&
+               point.X < fallbackRect.Right &&
+               point.Y >= fallbackRect.Top &&
+               point.Y < fallbackRect.Bottom;
+    }
+
+    private static bool TryGetTaskbarClockFallbackRect(IntPtr taskbar, out RECT fallbackRect)
+    {
+        fallbackRect = default;
+
+        if (!GetWindowRect(taskbar, out var taskbarRect))
             return false;
 
         var width = taskbarRect.Right - taskbarRect.Left;
@@ -349,100 +389,19 @@ public class SystemCalendarInterceptor : IDisposable
         if (width <= height)
             return false;
 
-        var dpi = GetDpiForWindow(root);
+        var dpi = GetDpiForWindow(taskbar);
         var scale = dpi > 0 ? dpi / 96.0 : 1.0;
         var fallbackWidth = (int)Math.Round(ClockFallbackWidthDip * scale);
         var rightInset = (int)Math.Round(ClockFallbackRightInsetDip * scale);
-        var left = taskbarRect.Right - rightInset - fallbackWidth;
-        var right = taskbarRect.Right - rightInset;
 
-        var hit = point.X >= left &&
-                  point.X < right &&
-                  point.Y >= taskbarRect.Top &&
-                  point.Y < taskbarRect.Bottom;
-
-        if (logDiagnostics)
+        fallbackRect = new RECT
         {
-            Log(
-                $"Taskbar geometry fallback at ({point.X},{point.Y}): rootClass='{rootClass}' " +
-                $"taskbar=({taskbarRect.Left},{taskbarRect.Top})-({taskbarRect.Right},{taskbarRect.Bottom}) " +
-                $"dpi={dpi} clockRangeX=[{left},{right}) hit={hit}");
-        }
-
-        return hit;
-    }
-
-    private static bool IsPointInsideClockDescendant(IntPtr taskbar, POINT point, bool logDiagnostics)
-    {
-        try
-        {
-            var taskbarElement = AutomationElement.FromHandle(taskbar);
-            var descendants = taskbarElement.FindAll(
-                TreeScope.Descendants,
-                System.Windows.Automation.Condition.TrueCondition);
-            var containingElements = new List<string>();
-
-            for (var i = 0; i < descendants.Count; i++)
-            {
-                var element = descendants[i];
-                string className;
-                string automationId;
-                string name;
-                ControlType? controlType;
-                System.Windows.Rect bounds;
-
-                try
-                {
-                    className = element.Current.ClassName ?? string.Empty;
-                    automationId = element.Current.AutomationId ?? string.Empty;
-                    name = element.Current.Name ?? string.Empty;
-                    controlType = element.Current.ControlType;
-                    bounds = element.Current.BoundingRectangle;
-                }
-                catch (ElementNotAvailableException)
-                {
-                    continue;
-                }
-
-                if (bounds.IsEmpty ||
-                    point.X < bounds.Left || point.X >= bounds.Right ||
-                    point.Y < bounds.Top || point.Y >= bounds.Bottom)
-                {
-                    continue;
-                }
-
-                if (logDiagnostics && containingElements.Count < 12)
-                {
-                    containingElements.Add(
-                        $"Class='{className}' AutomationId='{automationId}' Name='{name}' " +
-                        $"ControlType='{controlType?.ProgrammaticName ?? ""}' Rect={bounds}");
-                }
-
-                if (!LooksLikeClockElement(className, automationId, name, controlType))
-                    continue;
-
-                Log(
-                    $"Taskbar clock matched via descendant search: Class='{className}' " +
-                    $"AutomationId='{automationId}' Name='{name}' Rect={bounds}");
-                return true;
-            }
-
-            if (logDiagnostics && containingElements.Count > 0)
-                Log($"UIA taskbar descendants containing click: {string.Join(" || ", containingElements)}");
-        }
-        catch (ElementNotAvailableException)
-        {
-        }
-        catch (COMException ex)
-        {
-            Log($"WinCal: UI Automation descendant search failed: 0x{ex.HResult:X8}");
-        }
-        catch (InvalidOperationException ex)
-        {
-            Log($"WinCal: UI Automation descendant search failed: {ex.Message}");
-        }
-
-        return false;
+            Left = taskbarRect.Right - rightInset - fallbackWidth,
+            Top = taskbarRect.Top,
+            Right = taskbarRect.Right - rightInset,
+            Bottom = taskbarRect.Bottom
+        };
+        return true;
     }
 
     private static bool IsPointInsideTaskbarClock(IntPtr taskbar, POINT cursor)
