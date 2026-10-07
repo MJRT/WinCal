@@ -174,8 +174,7 @@ public class SystemCalendarInterceptor : IDisposable
                 var mouse = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
                 if (wParam == (IntPtr)WM_LBUTTONDOWN)
                 {
-                    var isClock = IsPointInsideCachedClock(mouse.pt) ||
-                                  IsPointInsideTaskbarClockFallback(mouse.pt);
+                    var isClock = IsTaskbarClockClick(mouse.pt);
                     if (isClock)
                     {
                         _suppressClockLeftButtonUp = true;
@@ -196,8 +195,7 @@ public class SystemCalendarInterceptor : IDisposable
 
                 if (wParam == (IntPtr)WM_RBUTTONDOWN)
                 {
-                    var isClock = IsPointInsideCachedClock(mouse.pt) ||
-                                  IsPointInsideTaskbarClockFallback(mouse.pt);
+                    var isClock = IsTaskbarClockClick(mouse.pt);
                     if (isClock)
                     {
                         _suppressClockRightButtonUp = true;
@@ -224,6 +222,38 @@ public class SystemCalendarInterceptor : IDisposable
         }
 
         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+    }
+
+    private bool IsTaskbarClockClick(POINT point)
+    {
+        if (!TryGetTaskbarAtPoint(point, out var taskbar))
+            return false;
+
+        return IsPointInsideCachedClock(point) ||
+               IsPointInsideTaskbarClockFallback(taskbar, point);
+    }
+
+    private static bool TryGetTaskbarAtPoint(POINT point, out IntPtr taskbar)
+    {
+        taskbar = IntPtr.Zero;
+
+        var window = WindowFromPoint(point);
+        if (window == IntPtr.Zero)
+            return false;
+
+        var root = GetAncestor(window, GA_ROOT);
+        if (root == IntPtr.Zero)
+            root = window;
+
+        var rootClass = GetWindowClassName(root);
+        if (!string.Equals(rootClass, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(rootClass, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        taskbar = root;
+        return true;
     }
 
     private bool IsPointInsideCachedClock(POINT point)
@@ -351,24 +381,9 @@ public class SystemCalendarInterceptor : IDisposable
         value.Contains("DateTime", StringComparison.OrdinalIgnoreCase) ||
         value.Contains("Clock", StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsPointInsideTaskbarClockFallback(POINT point)
+    private static bool IsPointInsideTaskbarClockFallback(IntPtr taskbar, POINT point)
     {
-        var window = WindowFromPoint(point);
-        if (window == IntPtr.Zero)
-            return false;
-
-        var root = GetAncestor(window, GA_ROOT);
-        if (root == IntPtr.Zero)
-            root = window;
-
-        var rootClass = GetWindowClassName(root);
-        if (!string.Equals(rootClass, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals(rootClass, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        if (!TryGetTaskbarClockFallbackRect(root, out var fallbackRect))
+        if (!TryGetTaskbarClockFallbackRect(taskbar, out var fallbackRect))
             return false;
 
         return point.X >= fallbackRect.Left &&
@@ -402,22 +417,6 @@ public class SystemCalendarInterceptor : IDisposable
             Bottom = taskbarRect.Bottom
         };
         return true;
-    }
-
-    private static bool IsPointInsideTaskbarClock(IntPtr taskbar, POINT cursor)
-    {
-        var trayNotify = FindWindowEx(taskbar, IntPtr.Zero, "TrayNotifyWnd", null);
-        if (trayNotify == IntPtr.Zero)
-            return false;
-
-        var clock = FindWindowEx(trayNotify, IntPtr.Zero, "TrayClockWClass", null);
-        if (clock == IntPtr.Zero || !GetWindowRect(clock, out var clockRect))
-            return false;
-
-        return cursor.X >= clockRect.Left &&
-               cursor.X < clockRect.Right &&
-               cursor.Y >= clockRect.Top &&
-               cursor.Y < clockRect.Bottom;
     }
 
     private static string GetWindowClassName(IntPtr hwnd)
