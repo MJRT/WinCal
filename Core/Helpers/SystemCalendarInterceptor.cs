@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Threading;
@@ -37,6 +38,9 @@ public class SystemCalendarInterceptor : IDisposable
     private const int GA_ROOT = 2;
     private const double ClockFallbackWidthDip = 72;
     private const double ClockFallbackRightInsetDip = 4;
+    private static readonly Regex ClockTimePattern = new(
+        @"(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?(?!\d)",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     // Win32 API
     [DllImport("user32.dll")]
@@ -379,11 +383,11 @@ public class SystemCalendarInterceptor : IDisposable
             return true;
 
         // Some Windows 11 builds expose the clock as a generic SystemTrayIcon button.
-        // Its accessible name still contains the rendered time (for example "14:39").
+        // Match an actual time token, not just any name with digits and a colon:
+        // volume/battery accessible names can also contain values such as "100%".
         return controlType == ControlType.Button &&
                automationId.Equals("SystemTrayIcon", StringComparison.OrdinalIgnoreCase) &&
-               name.Any(char.IsDigit) &&
-               name.Contains(':');
+               ClockTimePattern.IsMatch(name);
     }
 
     private static bool ContainsClockToken(string value) =>
