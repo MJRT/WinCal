@@ -23,7 +23,7 @@ public class SystemCalendarInterceptor : IDisposable
     private bool _suppressClockLeftButtonUp;
     private bool _suppressClockRightButtonUp;
     private readonly object _clockRectsLock = new();
-    private List<RECT> _clockRects = new();
+    private Dictionary<IntPtr, List<RECT>> _clockRectsByTaskbar = new();
     private static readonly string LogDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinCal");
     private static readonly string LogPath = Path.Combine(LogDirectory, "interceptor.log");
@@ -35,7 +35,7 @@ public class SystemCalendarInterceptor : IDisposable
     private const int WM_RBUTTONDOWN = 0x0204;
     private const int WM_RBUTTONUP = 0x0205;
     private const int GA_ROOT = 2;
-    private const double ClockFallbackWidthDip = 100;
+    private const double ClockFallbackWidthDip = 72;
     private const double ClockFallbackRightInsetDip = 4;
 
     // Win32 API
@@ -229,8 +229,21 @@ public class SystemCalendarInterceptor : IDisposable
         if (!TryGetTaskbarAtPoint(point, out var taskbar))
             return false;
 
-        return IsPointInsideCachedClock(point) ||
-               IsPointInsideTaskbarClockFallback(taskbar, point);
+        lock (_clockRectsLock)
+        {
+            if (_clockRectsByTaskbar.TryGetValue(taskbar, out var clockRects) &&
+                clockRects.Count > 0)
+            {
+                // A precise clock rectangle was found for this taskbar. Do not OR
+                // it with the broad geometry fallback: at high DPI that fallback
+                // also covers the adjacent volume and battery icons.
+                return clockRects.Any(rect => IsPointInsideRect(point, rect));
+            }
+        }
+
+        // Only use geometry when UI Automation/legacy HWND discovery could not
+        // find a precise clock rectangle for this specific taskbar.
+        return IsPointInsideTaskbarClockFallback(taskbar, point);
     }
 
     private static bool TryGetTaskbarAtPoint(POINT point, out IntPtr taskbar)
@@ -256,19 +269,15 @@ public class SystemCalendarInterceptor : IDisposable
         return true;
     }
 
-    private bool IsPointInsideCachedClock(POINT point)
+    private static bool IsPointInsideRect(POINT point, RECT rect)
     {
-        lock (_clockRectsLock)
-        {
-            return _clockRects.Any(rect =>
-                point.X >= rect.Left && point.X < rect.Right &&
-                point.Y >= rect.Top && point.Y < rect.Bottom);
-        }
+        return point.X >= rect.Left && point.X < rect.Right &&
+               point.Y >= rect.Top && point.Y < rect.Bottom;
     }
 
     private void RefreshClockHitRects()
     {
-        var rects = new List<RECT>();
+        var rectsByTaskbar = new Dictionary<IntPtr, List<RECT>>();
         var taskbars = new List<IntPtr>();
 
         var primaryTaskbar = FindWindow("Shell_TrayWnd", null);
@@ -289,14 +298,14 @@ public class SystemCalendarInterceptor : IDisposable
 
         foreach (var taskbar in taskbars.Distinct())
         {
-            var countBefore = rects.Count;
+            var taskbarRects = new List<RECT>();
 
             var trayNotify = FindWindowEx(taskbar, IntPtr.Zero, "TrayNotifyWnd", null);
             if (trayNotify != IntPtr.Zero)
             {
                 var legacyClock = FindWindowEx(trayNotify, IntPtr.Zero, "TrayClockWClass", null);
                 if (legacyClock != IntPtr.Zero && GetWindowRect(legacyClock, out var legacyRect))
-                    rects.Add(legacyRect);
+                    taskbarRects.Add(legacyRect);
             }
 
             try
@@ -336,7 +345,7 @@ public class SystemCalendarInterceptor : IDisposable
                         continue;
                     }
 
-                    rects.Add(new RECT
+                    taskbarRects.Add(new RECT
                     {
                         Left = (int)Math.Floor(bounds.Left),
                         Top = (int)Math.Floor(bounds.Top),
@@ -350,14 +359,14 @@ public class SystemCalendarInterceptor : IDisposable
                 Log($"WinCal: Clock UIA cache refresh failed: {ex.Message}");
             }
 
-            if (rects.Count == countBefore && TryGetTaskbarClockFallbackRect(taskbar, out var fallbackRect))
-                rects.Add(fallbackRect);
+            rectsByTaskbar[taskbar] = taskbarRects;
+            Log(taskbarRects.Count > 0
+                ? $"WinCal: Cached {taskbarRects.Count} precise clock hit region(s) for taskbar 0x{taskbar.ToInt64():X}."
+                : $"WinCal: No precise clock region found for taskbar 0x{taskbar.ToInt64():X}; using narrow geometry fallback.");
         }
 
         lock (_clockRectsLock)
-            _clockRects = rects;
-
-        Log($"WinCal: Cached {rects.Count} taskbar clock hit region(s).");
+            _clockRectsByTaskbar = rectsByTaskbar;
     }
 
     private static bool LooksLikeClockElement(
